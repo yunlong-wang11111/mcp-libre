@@ -1,3 +1,15 @@
+# mcp-libre（工作增强版）
+
+> Fork 自 [patrup/mcp-libre](https://github.com/patrup/mcp-libre)（MIT），感谢原作基座。本版在其上增强：
+
+- **公式感知路由**：docx 含 OMML 公式时自动改走 Word COM 真渲染（LibreOffice 会忽略公式字号，Bug 32419）
+- **Word COM 优先**：Windows 上 docx→pdf 默认先走 Word（大带图文档 LO 常超时，Word 快 5 倍+字体保真），失败自动回退 LO
+- **MCP 形态接入**：任意 MCP 客户端可注册（uv venv + 依赖安装后以 stdio 运行 src/main.py）
+
+安装：`git clone` 本仓库 → `uv venv .venv && uv pip install -r requirements`（或参考 pyproject.toml）→ MCP 客户端注册 `command: <仓库>/.venv/Scripts/python.exe, args: [<仓库>/src/main.py]`。
+
+---
+
 # LibreOffice MCP Server
 
 A comprehensive Model Context Protocol (MCP) server that provides tools and resources for interacting with LibreOffice documents. This server enables AI assistants and other MCP clients to create, read, convert, and manipulate LibreOffice documents programmatically.

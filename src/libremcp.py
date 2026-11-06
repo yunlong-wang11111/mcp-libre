@@ -51,6 +51,7 @@ class ConversionResult(BaseModel):
     target_format: str = Field(description="Converted format")
     success: bool = Field(description="Whether conversion was successful")
     error_message: Optional[str] = Field(description="Error message if conversion failed")
+    details: Optional[str] = Field(default=None, description="补充说明（转换引擎/警告）")
 
 
 class SpreadsheetData(BaseModel):
@@ -62,11 +63,28 @@ class SpreadsheetData(BaseModel):
 
 
 # Helper functions
-def _run_libreoffice_command(args: List[str], timeout: int = 30) -> subprocess.CompletedProcess:
+import tempfile as _tempfile
+_LO_PROFILE = __import__('os').path.join(_tempfile.gettempdir(), 'libremcp_lo_profile').replace(chr(92), '/')
+# 2026-10-20 Windows soffice 三大坑的对症参数:
+#   -env:UserInstallation=独立profile —— 不与用户 GUI/其他实例共用(共用时等锁挂死=30s 超时的根因,
+#     或命令被转发给已开实例后秒退但文件不出); --norestore 防崩溃恢复对话框在无交互环境挂死;
+#     --nologo/--nolockcheck 减少无谓等待。放函数外算一次。
+def _lo_base_args():
+    return ['--norestore', '--nologo', '--nolockcheck',
+            '-env:UserInstallation=file:///' + _LO_PROFILE]
+
+
+def _run_libreoffice_command(args: List[str], timeout: int = 240) -> subprocess.CompletedProcess:
+    # 2026-10-20: 30s->180s. 2026-11-03: 180s->240s——657KB 带图 docx 实测 180s 干不完
+    # （外层 MCP toolCallTimeoutMs=300s，内层留 60s 余量防外层先杀）。
+    # 带图大文档 30s 必超(AI 重试再超 = 用户看到的 两次都超时)
     """Run a LibreOffice command with proper error handling"""
     try:
         # Try different common LibreOffice executable names
-        for executable in ['libreoffice', 'loffice', 'soffice']:
+        # 2026-10-15 local adaptation: Windows LibreOffice is not in the PATH -- add absolute path
+        for executable in [r'C:\Program Files\LibreOffice\program\soffice.com',
+                           'libreoffice', 'loffice', 'soffice',
+                           r'C:\Program Files\LibreOffice\program\soffice.exe']:
             try:
                 cmd = [executable] + args
                 result = subprocess.run(
@@ -142,7 +160,7 @@ def create_document(path: str, doc_type: str = "writer", content: str = "") -> D
             try:
                 # Try to convert text to ODT
                 result = _run_libreoffice_command([
-                    '--headless',
+                    *_lo_base_args(), '--headless',
                     '--convert-to', 'odt',
                     '--outdir', str(path_obj.parent),
                     tmp_path
@@ -200,7 +218,7 @@ def create_document(path: str, doc_type: str = "writer", content: str = "") -> D
                 
                 # Create using LibreOffice command line
                 result = _run_libreoffice_command([
-                    '--headless',
+                    *_lo_base_args(), '--headless',
                     '--invisible',
                     '--nodefault',
                     '--nolockcheck',
@@ -262,7 +280,7 @@ def read_document_text(path: str) -> TextContent:
         # Use LibreOffice to convert to plain text
         with tempfile.TemporaryDirectory() as tmp_dir:
             result = _run_libreoffice_command([
-                '--headless',
+                *_lo_base_args(), '--headless',
                 '--convert-to', 'txt',
                 '--outdir', tmp_dir,
                 str(path_obj)
@@ -348,9 +366,75 @@ def _extract_text_from_odt(file_path: str) -> str:
 
 
 @mcp.tool()
+def _docx_has_omml(path: Path) -> bool:
+    """检测 docx 是否含 OMML 公式（word/document.xml 里查 <m:oMath）。
+
+    2026-10-24：LibreOffice 对 OMML 的 run 字号（m:r/w:rPr/w:sz）完全忽略，
+    公式全部按 Math 组件默认基准字号渲染（LO Bug 32419，多年未修）——
+    含公式的 docx 用 LO 转 PDF，公式字号/溢出判断全部失真。
+    含公式 → 路由 Word COM（真渲染）；无公式 → LO 照旧（快）。
+    """
+    try:
+        import zipfile
+        with zipfile.ZipFile(path) as z:
+            xml = z.read('word/document.xml')[:4_000_000]
+            return b'<m:oMath' in xml
+    except Exception:
+        return False   # 检测失败按无公式处理（保持旧行为）
+
+
+def _convert_docx_pdf_via_word(source: Path, target: Path) -> str | None:
+    """Word COM 转 PDF（公式保真）。返回错误信息或 None（成功）。
+
+    模式复用 aic_race 的成熟经验：独立实例 DispatchEx + ReadOnly + 不显示窗口 +
+    前后 PID 差集清理孤儿（只杀自己拉起的 WINWORD）。
+    """
+    import subprocess
+    try:
+        import win32com.client as w32
+    except ImportError:
+        return "pywin32 未安装"
+    before = set()
+    try:
+        before = {int(x) for x in subprocess.run(
+            ['tasklist', '/FI', "IMAGENAME eq WINWORD.EXE", '/FO', 'CSV', '/NH'],
+            capture_output=True, text=True, timeout=15).stdout.splitlines()
+            if x.startswith('"WINWORD')}
+    except Exception:
+        pass
+    word = doc = None
+    try:
+        word = w32.DispatchEx('Word.Application')
+        word.Visible = False
+        word.DisplayAlerts = 0
+        doc = word.Documents.Open(str(source), ReadOnly=True, AddToRecentFiles=False, Visible=False)
+        doc.ExportAsFixedFormat(OutputFileName=str(target), ExportFormat=17)  # 17 = wdExportFormatPDF
+        return None
+    except Exception as e:
+        return f"Word COM 转换失败: {e}"
+    finally:
+        try:
+            if doc is not None: doc.Close(SaveChanges=0)
+        except Exception: pass
+        try:
+            if word is not None: word.Quit()
+        except Exception: pass
+        # 孤儿清理：杀掉本次拉起且已游离的 WINWORD
+        try:
+            out = subprocess.run(
+                ['tasklist', '/FI', "IMAGENAME eq WINWORD.EXE", '/FO', 'CSV', '/NH'],
+                capture_output=True, text=True, timeout=15).stdout
+            now = {int(x.split('","')[1]) for x in out.splitlines() if x.startswith('"WINWORD')}
+            for pid in (now - before):
+                subprocess.run(['taskkill', '/F', '/T', '/PID', str(pid)],
+                               capture_output=True, timeout=15)
+        except Exception:
+            pass
+
+
 def convert_document(source_path: str, target_path: str, target_format: str) -> ConversionResult:
     """Convert a document to a different format
-    
+
     Args:
         source_path: Path to the source document
         target_path: Path where converted document should be saved
@@ -358,7 +442,7 @@ def convert_document(source_path: str, target_path: str, target_format: str) -> 
     """
     source_obj = Path(source_path)
     target_obj = Path(target_path)
-    
+
     if not source_obj.exists():
         return ConversionResult(
             source_path=source_path,
@@ -368,13 +452,46 @@ def convert_document(source_path: str, target_path: str, target_format: str) -> 
             success=False,
             error_message=f"Source file not found: {source_path}"
         )
-    
+
     # Ensure target directory exists
     target_obj.parent.mkdir(parents=True, exist_ok=True)
-    
+
+    # 公式感知路由（2026-10-24）+ Word 优先（2026-11-03）：
+    # ①docx→pdf 一律先试 Word COM——LO 对大带图 docx 常超时（657KB 实测 180s 内干不完，
+    #   连续数日报超时），Word COM 快且字体保真；②Word 失败再回退 LO；③含 OMML 公式的
+    #   文档本来就必须走 Word（LO 忽略公式字号，Bug 32419），回退时带不可信警告。
+    if (source_obj.suffix.lower() == '.docx' and target_format.lower() == 'pdf'):
+        has_formula = _docx_has_omml(source_obj)
+        err = _convert_docx_pdf_via_word(source_obj, target_obj)
+        if err is None and target_obj.exists():
+            return ConversionResult(
+                source_path=source_path,
+                target_path=str(target_obj),
+                source_format='docx',
+                target_format=target_format,
+                success=True,
+                error_message=None,
+                conversion_time_seconds=0.0,
+                details=('via Word COM（含 OMML 公式，LO 会忽略公式字号故走真渲染）' if has_formula
+                         else 'via Word COM（2026-11-03 起默认优先——LO 对大带图文档超时）'),
+            )
+        # 回退 LO；含公式时结果里带上不可信警告
+        result_lo = _lo_fallback_convert(source_obj, target_obj, target_format)
+        if has_formula:
+            result_lo.details = (result_lo.details or '') + \
+                f'；⚠️ Word COM 不可用（{err}），已回退 LibreOffice——公式字号渲染不可信，验证公式段落请用 Word'
+        else:
+            result_lo.details = (result_lo.details or '') + f'；⚠️ Word COM 不可用（{err}），已回退 LibreOffice'
+        return result_lo
+
+    return _lo_fallback_convert(source_obj, target_obj, target_format)
+
+
+def _lo_fallback_convert(source_obj: Path, target_obj: Path, target_format: str) -> ConversionResult:
+    """原 LibreOffice 转换路径（无公式文档的主路径；含公式文档的回退）。"""
     try:
         result = _run_libreoffice_command([
-            '--headless',
+            *_lo_base_args(), '--headless',
             '--convert-to', target_format,
             '--outdir', str(target_obj.parent),
             str(source_obj)
@@ -383,26 +500,26 @@ def convert_document(source_path: str, target_path: str, target_format: str) -> 
         # LibreOffice creates the file with a predictable name
         expected_output = target_obj.parent / (source_obj.stem + f'.{target_format}')
         
-        # Move to target location if needed
+        # Move to target location if needed（replace=覆盖式：重复转换同名目标不再 WinError 183）
         if expected_output.exists() and expected_output != target_obj:
-            expected_output.rename(target_obj)
+            expected_output.replace(target_obj)
         
         success = target_obj.exists()
         error_msg = None if success else f"Conversion failed. LibreOffice output: {result.stderr}"
         
         return ConversionResult(
-            source_path=source_path,
+            source_path=str(source_obj),
             target_path=str(target_obj),
             source_format=source_obj.suffix.lower().lstrip('.'),
             target_format=target_format,
             success=success,
             error_message=error_msg
         )
-        
+
     except Exception as e:
         return ConversionResult(
-            source_path=source_path,
-            target_path=target_path,
+            source_path=str(source_obj),
+            target_path=str(target_obj),
             source_format=source_obj.suffix.lower().lstrip('.'),
             target_format=target_format,
             success=False,
@@ -437,7 +554,7 @@ def read_spreadsheet_data(path: str, sheet_name: Optional[str] = None, max_rows:
         # Convert to CSV to easily read the data
         with tempfile.TemporaryDirectory() as tmp_dir:
             result = _run_libreoffice_command([
-                '--headless',
+                *_lo_base_args(), '--headless',
                 '--convert-to', 'csv',
                 '--outdir', tmp_dir,
                 str(path_obj)
@@ -524,11 +641,169 @@ def insert_text_at_position(path: str, text: str, position: str = "end") -> Docu
         finally:
             # Clean up backup
             Path(backup_path).unlink(missing_ok=True)
-        
+
         return _get_document_info(str(path_obj))
-        
+
     except Exception as e:
         raise RuntimeError(f"Failed to insert text: {str(e)}")
+
+
+# ── PPT 布局精确读取（2026-10-23：python-pptx 直读 .pptx，无头/秒回/零窗口）─────────
+# 背景：read_document_text 走 --convert-to txt，文字之外的位置/尺寸/层级全部丢失，
+# AI 对 PPT 是"盲操作"。本工具补上 shape 级几何：坐标/宽高（cm）、旋转、占位符角色、
+# z 序、组内递归展开。仅支持 .pptx（.ppt/.odp 请先 convert_document 转 pptx）。
+
+class ShapeInfo(BaseModel):
+    index: int = Field(description="页内序号（z 序，0 最底层）")
+    name: str = Field(default="")
+    type: str = Field(description="元素类型：placeholder/picture/text_box/group/table/chart 等")
+    placeholder_role: Optional[str] = Field(default=None, description="占位符角色（title/body/...），非占位符为空")
+    left_cm: Optional[float] = Field(default=None, description="左上角 X（厘米）")
+    top_cm: Optional[float] = Field(default=None, description="左上角 Y（厘米）")
+    width_cm: Optional[float] = Field(default=None, description="宽（厘米）")
+    height_cm: Optional[float] = Field(default=None, description="高（厘米）")
+    rotation: float = Field(default=0, description="旋转角度")
+    text_preview: Optional[str] = Field(default=None, description="文本前 40 字（有文本时）")
+    children: Optional[List["ShapeInfo"]] = Field(default=None, description="组内子元素（group 递归展开）")
+
+
+class SlideLayoutInfo(BaseModel):
+    slide: int = Field(description="页码，从 1 开始")
+    layout_name: Optional[str] = Field(default=None, description="该页所用版式名（装饰形状见 layouts 清单）")
+    master_name: Optional[str] = Field(default=None, description="该页所属母版名（装饰形状见 masters 清单）")
+    shapes: List[ShapeInfo] = Field(default_factory=list)
+
+
+class LayoutDef(BaseModel):
+    """母版或版式的装饰清单（去重后只出现一次）。z 序：master 最底层 < layout 中层 < slide 页面形状最顶层。
+    重叠/遮挡判断必须三层合并——"标题压住橙色块"这类问题，橙色块往往就在 layout/master 上。"""
+    name: str = Field(description="母版/版式名")
+    shapes: List[ShapeInfo] = Field(default_factory=list)
+
+
+class ImpressLayout(BaseModel):
+    path: str
+    slides_total: int
+    slide_width_cm: float = Field(description="页面宽（厘米）")
+    slide_height_cm: float = Field(description="页面高（厘米）")
+    masters: List[LayoutDef] = Field(default_factory=list, description="母版装饰清单（z 序最底层）")
+    layouts: List[LayoutDef] = Field(default_factory=list, description="版式装饰清单（z 序介于母版与页面形状之间）")
+    slides: List[SlideLayoutInfo]
+
+
+def _shape_children_recursive(shapes, start_index: int = 0) -> List[ShapeInfo]:
+    out: List[ShapeInfo] = []
+    for i, sh in enumerate(shapes):
+        try:
+            st = str(sh.shape_type).split(" ")[0] if sh.shape_type is not None else "unknown"
+        except Exception:
+            st = "unknown"
+        role = None
+        try:
+            if sh.is_placeholder:
+                role = str(sh.placeholder_format.type).split(" ")[0]
+                st = "placeholder"
+        except Exception:
+            pass
+        def _cm(v):
+            return round(v / 360000.0, 2) if v is not None else None
+        text = None
+        try:
+            if sh.has_text_frame and sh.text_frame.text:
+                text = sh.text_frame.text.replace("\n", " ⏎ ")[:40]
+        except Exception:
+            pass
+        kids = None
+        try:
+            if st == "GROUP" or str(sh.shape_type) == "GROUP (6)":
+                kids = _shape_children_recursive(sh.shapes)
+                st = "group"
+        except Exception:
+            pass
+        out.append(ShapeInfo(
+            index=i, name=sh.name or "", type=st.lower(), placeholder_role=role.lower() if role else None,
+            left_cm=_cm(sh.left), top_cm=_cm(sh.top), width_cm=_cm(sh.width), height_cm=_cm(sh.height),
+            rotation=float(getattr(sh, "rotation", 0) or 0), text_preview=text, children=kids,
+        ))
+    return out
+
+
+def _parse_slides_arg(slides: Optional[str], total: int) -> Optional[set]:
+    """'2' / '1,3-5' → 页号集合；None/空 → 全部页。"""
+    if not slides or not slides.strip():
+        return None
+    want: set = set()
+    for part in slides.replace("，", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            a, _, b = part.partition("-")
+            want.update(range(int(a), int(b) + 1))
+        else:
+            want.add(int(part))
+    want = {i for i in want if 1 <= i <= total}
+    return want or None
+
+
+@mcp.tool()
+def read_impress_layout(path: str, slides: Optional[str] = None) -> ImpressLayout:
+    """精确读取 PPT（.pptx）每页每个元素的几何布局：坐标/宽高（厘米）、旋转、占位符角色、z 序、组内子元素、文本摘要。
+
+    三层 z 序：masters（最底层装饰） < layouts（版式装饰） < 页面 shapes（最顶层）。
+    重叠/遮挡判断必须三层合并——"标题压住橙色块"这类问题，装饰块在版式/母版上，只看页面形状查不出来。
+    页面元素几何为 None 表示未显式设置（继承版式占位符位置）。
+
+    用于回答"这个元素在页面哪里/多大面积/有没有重叠出界/层级谁压谁"——read_document_text 只给文字流，
+    位置信息在文本转换时全部丢失。仅支持 .pptx；.ppt/.odp 先用 convert_document 转 pptx 再读。
+
+    Args:
+        path: PPT 文件路径（.pptx）
+        slides: 可选，页码过滤，如 "1" 或 "1,3-5"；缺省读全部页
+    """
+    path_obj = Path(path)
+    if not path_obj.exists():
+        raise FileNotFoundError(f"Document not found: {path}")
+    if path_obj.suffix.lower() not in (".pptx",):
+        raise ValueError(f"仅支持 .pptx（当前 {path_obj.suffix}）。.ppt/.odp 请先用 convert_document 转成 pptx。")
+    try:
+        from pptx import Presentation
+    except ImportError as e:
+        raise RuntimeError("python-pptx 未安装：请在 mcp-libre 目录用 .venv 的 python 跑 install_pptx.py") from e
+    try:
+        prs = Presentation(str(path_obj))
+    except Exception as e:
+        raise RuntimeError(f"打开 pptx 失败（文件损坏或非标准格式）: {e}") from e
+    want = _parse_slides_arg(slides, len(prs.slides))
+    out_slides: List[SlideLayoutInfo] = []
+    layouts_defs: dict = {}
+    masters_defs: dict = {}
+    for idx, slide in enumerate(prs.slides, start=1):
+        if want is not None and idx not in want:
+            continue
+        layout_name = master_name = None
+        try:
+            layout = slide.slide_layout
+            layout_name = layout.name or f"layout-{len(layouts_defs) + 1}"
+            if layout_name not in layouts_defs:
+                layouts_defs[layout_name] = LayoutDef(name=layout_name, shapes=_shape_children_recursive(layout.shapes))
+            master = layout.slide_master
+            master_name = master.name or f"master-{len(masters_defs) + 1}"
+            if master_name not in masters_defs:
+                masters_defs[master_name] = LayoutDef(name=master_name, shapes=_shape_children_recursive(master.shapes))
+        except Exception:
+            pass
+        out_slides.append(SlideLayoutInfo(
+            slide=idx, layout_name=layout_name, master_name=master_name,
+            shapes=_shape_children_recursive(slide.shapes),
+        ))
+    return ImpressLayout(
+        path=str(path_obj), slides_total=len(prs.slides),
+        slide_width_cm=round(prs.slide_width / 360000.0, 2),
+        slide_height_cm=round(prs.slide_height / 360000.0, 2),
+        masters=list(masters_defs.values()), layouts=list(layouts_defs.values()),
+        slides=out_slides,
+    )
 
 
 def _insert_text_writer_document(path: str, content: str) -> bool:
@@ -624,7 +899,7 @@ def _recreate_writer_document(path: str, content: str):
         try:
             # Method 1: Convert using LibreOffice
             result = _run_libreoffice_command([
-                '--headless',
+                *_lo_base_args(), '--headless',
                 '--invisible', 
                 '--convert-to', target_format,
                 '--outdir', str(path_obj.parent),
@@ -1078,7 +1353,7 @@ async def test_libreoffice_installation():
     
     # Test headless mode
     try:
-        result = _run_libreoffice_command(['--headless', '--help'])
+        result = _run_libreoffice_command([*_lo_base_args(), '--headless', '--help'])
         if result.returncode == 0 or 'headless' in result.stdout.lower():
             print("✓ LibreOffice headless mode available")
         else:
@@ -1158,7 +1433,7 @@ def refresh_document_in_libreoffice(path: str) -> Dict[str, Any]:
         try:
             # This is a more advanced approach that may work if LibreOffice is running
             result = subprocess.run([
-                'libreoffice', '--invisible', '--headless',
+                'libreoffice', '--invisible', *_lo_base_args(), '--headless',
                 '--accept=socket,host=127.0.0.1,port=2002;urp;',
                 '--norestore', '--nologo'
             ], timeout=2, capture_output=True)
